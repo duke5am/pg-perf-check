@@ -89,4 +89,4 @@ PostgreSQL 12+, Python 3.8+, and a Postgres driver (`psycopg2`).
 The paid kit adds `INDEXING-PLAYBOOK.md` and the prioritised findings report in
 `--json` form for CI.
 
-→ **Postgres Performance Toolkit**: <!-- GUMROAD-LINK -->
+→ **[Postgres Performance Toolkit](https://duke5am.gumroad.com/l/05-postgres-perf-toolkit)** — $29 on Gumroad <!-- GUMROAD-LINK -->
