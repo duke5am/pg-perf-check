@@ -52,8 +52,37 @@
 --       transaction and stall the table behind it.
 --
 -- VERSION NOTES
---   * `pg_stat_progress_vacuum` is 9.6+. The columns used in Q7.6 exist
---     from 9.6 through 18.
+--   * `pg_stat_progress_vacuum` is 9.6+.
+--   * Q7.6's SECOND statement reads the dead-tuple-store columns of
+--     `pg_stat_progress_vacuum`, which PostgreSQL 17 RENAMED and RE-UNIT-ED.
+--     This is not a pure rename:
+--
+--         PostgreSQL 16 and older : max_dead_tuples       - a TUPLE count
+--                                   num_dead_tuples       - a TUPLE count
+--         PostgreSQL 17 and newer : max_dead_tuple_bytes  - BYTES
+--                                   dead_tuple_bytes      - BYTES
+--                                   num_dead_item_ids     - a count of item IDs
+--
+--     Naming either branch's columns directly makes the statement fail to
+--     parse on the other branch, so the version-specific fields are read out
+--     of the row's JSON form (`to_jsonb(p) ->> '...'`). That parses on every
+--     supported version and yields NULL for a key your version does not have.
+--     The result column `dead_store_units` says which branch you are on -
+--     'tuples' on 16 and older, 'bytes' on 17 and newer - and Q7.6 reports
+--     capacity and usage in that same unit, so `pct_dead_store_full` is a
+--     like-for-like ratio on both branches (on 17+ the byte pair is the
+--     comparable one; `num_dead_item_ids` is NOT byte-comparable).
+--
+--     VERIFIED on PostgreSQL 17.11 (this pack's build server): the statement
+--     parses, executes and returns without error, and `dead_store_units`
+--     reports 'bytes'. It returns no rows when no VACUUM is running, which is
+--     the normal state; the branch itself was exercised by shape, not by
+--     catching a live vacuum mid-flight. The 'tuples' branch taken on 16 and
+--     older is **UNVERIFIED** - no 16-or-older server was available here.
+--   * Q7.7 reads `pg_stat_user_tables`, which is already scoped to the
+--     current database and has never had a `datname` column on any release.
+--     Naming one there fails with 42703 on EVERY version, so this file uses
+--     `schemaname` and `relname`. VERIFIED on PostgreSQL 17.11.
 --   * `pg_stat_activity.backend_type` is PostgreSQL 10+. On 9.6, Q7.6's
 --     first query still works via its `query ILIKE 'autovacuum:%'` terms
 --     but will not see a worker that is between statements; drop the
@@ -361,6 +390,11 @@ WHERE a.backend_type = 'autovacuum worker'
 ORDER BY a.xact_start ASC;
 
 -- Phase-level detail for the ones currently running.
+--
+-- The dead-tuple-store columns differ by version (see VERSION NOTES at the top
+-- of this file), so they are read out of the row's JSON form instead of being
+-- named directly: naming either branch's columns makes this statement fail to
+-- PARSE on the other branch, not merely return nothing.
 SELECT
     p.pid,
     p.datname,
@@ -374,10 +408,31 @@ SELECT
     round(100.0 * p.heap_blks_vacuumed
           / NULLIF(p.heap_blks_total, 0), 1)             AS pct_vacuumed,
     p.index_vacuum_count,
-    p.max_dead_tuples,
-    p.num_dead_tuples,
+    -- Which unit the two columns below are in: 'tuples' on 16 and older,
+    -- 'bytes' on 17 and newer.
+    CASE WHEN rowjson ? 'max_dead_tuples' THEN 'tuples'
+         ELSE 'bytes' END                               AS dead_store_units,
+    -- How much dead-tuple data the maintenance_work_mem store can hold.
+    -- 16-: max_dead_tuples (a tuple count). 17+: max_dead_tuple_bytes.
+    COALESCE((rowjson ->> 'max_dead_tuples')::bigint,
+             (rowjson ->> 'max_dead_tuple_bytes')::bigint)
+                                                        AS dead_store_capacity,
+    -- How much of that store is in use, in the SAME unit as the capacity
+    -- above. 16-: num_dead_tuples (a tuple count). 17+: dead_tuple_bytes -
+    -- deliberately NOT num_dead_item_ids, which counts item identifiers and
+    -- is therefore not comparable with a byte capacity.
+    COALESCE((rowjson ->> 'num_dead_tuples')::bigint,
+             (rowjson ->> 'dead_tuple_bytes')::bigint)  AS dead_store_used,
+    -- The ratio that matters: both branches compare like with like, so this
+    -- is meaningful on 16- and on 17+ even though the units differ.
+    round(100.0 * COALESCE((rowjson ->> 'num_dead_tuples')::numeric,
+                           (rowjson ->> 'dead_tuple_bytes')::numeric)
+          / NULLIF(COALESCE((rowjson ->> 'max_dead_tuples')::numeric,
+                            (rowjson ->> 'max_dead_tuple_bytes')::numeric), 0), 1)
+                                                        AS pct_dead_store_full,
     (SELECT count(*) FROM pg_index i WHERE i.indrelid = p.relid) AS table_index_count
 FROM pg_stat_progress_vacuum p
+CROSS JOIN LATERAL (SELECT to_jsonb(p) AS rowjson) AS rowjson_source
 ORDER BY p.heap_blks_total DESC;
 
 -- Reading this:
@@ -389,9 +444,11 @@ ORDER BY p.heap_blks_total DESC;
 --   * Phase flickering between 'scanning heap' and 'vacuuming heap' with
 --     pct_scanned not advancing: the worker is being throttled by
 --     autovacuum_vacuum_cost_delay. See Q7.7.
---   * num_dead_tuples near max_dead_tuples: the maintenance_work_mem
---     dead-tuple array filled up and vacuum had to restart its heap pass.
---     Raise maintenance_work_mem for the autovacuum workers.
+--   * pct_dead_store_full near 100: the maintenance_work_mem dead-tuple
+--     store filled up, so vacuum had to stop and run an index vacuum cycle,
+--     and on a large table it then restarts its heap pass. Raise
+--     maintenance_work_mem for the autovacuum workers, or drop the indexes
+--     that no query uses so each cycle is cheaper.
 
 
 -- ---------------------------------------------------------------------
@@ -431,8 +488,13 @@ ORDER BY p.heap_blks_total DESC;
 -- very large tables can be tuned aggressively without changing the
 -- behaviour of the other few thousand small tables. That is the single
 -- most useful autovacuum trick in this file.
+-- `pg_stat_user_tables` is already scoped to the database you are connected
+-- to, and has never had a `datname` column on any PostgreSQL release - naming
+-- one here fails with 42703 "column datname does not exist" on every version,
+-- not only on 17. Identify the row by schema and table instead.
 SELECT
-    datname,
+    schemaname,
+    relname,
     n_dead_tup,
     n_live_tup,
     seq_scan,

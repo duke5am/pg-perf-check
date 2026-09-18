@@ -1355,6 +1355,42 @@ def check_settings(rows: List[Dict[str, Any]]) -> List[Finding]:
         v = setting(name)
         return opt_num(v)
 
+    def memory_mb(name: str) -> Optional[float]:
+        """A memory setting's value in MB, converted using its `unit` column.
+
+        `pg_settings.setting` is a bare number expressed in whatever unit the
+        sibling `unit` column names - it is NOT self-describing. A default
+        shared_buffers arrives as `setting = '16384', unit = '8kB'`, so reading
+        `setting` alone and assuming bytes reported a real 128 MB as
+        "approximately 0 MB". Returns None when the row is missing or its unit
+        is not a known memory unit, so callers never act on a guessed number.
+        """
+        row = current.get(name)
+        if row is None or row.get("setting") is None:
+            return None
+        text = str(row.get("setting")).strip()
+        unit = str(row.get("unit") or "").strip().lower()
+        m = re.match(r"^([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\s*([A-Za-z]*)$", text)
+        if not m:
+            return None
+        try:
+            value = float(m.group(1))
+        except ValueError:
+            return None
+        if m.group(2):
+            # Some settings spell the unit in the value itself ('128MB'); the
+            # `unit` column then repeats it or is empty. Trust the value.
+            unit = m.group(2).lower()
+        factors = {"b": 1.0, "kb": 1024.0, "mb": 1024.0 ** 2,
+                   "gb": 1024.0 ** 3, "tb": 1024.0 ** 4}
+        factor = factors.get(unit)
+        if factor is None and unit.endswith("b") and unit[:-2].isdigit():
+            # pg_settings reports block-sized units as '8kB', '16kB', '32kB'...
+            factor = float(unit[:-2]) * 1024.0
+        if factor is None:
+            return None
+        return value * factor / (1024.0 * 1024.0)
+
     if setting("autovacuum") in ("off", "false", "0"):
         findings.append(Finding(
             1, "autovacuum_off",
@@ -1430,38 +1466,29 @@ def check_settings(rows: List[Dict[str, Any]]) -> List[Finding]:
             "     ALTER TABLE public.<table> SET (autovacuum_vacuum_cost_limit = 1000);",
             "sql/07-vacuum-and-autovacuum.sql (Q7.1/Q7.7)"))
     buff = setting("shared_buffers")
-    if buff is not None:
-        mb = 0.0
-        m = re.match(r"^\s*([0-9.]+)\s*([kKmMgG]?[bB]?)\s*$", buff)
-        if m:
-            value = float(m.group(1))
-            unit = m.group(2).lower()
-            mb = value / 1024.0 / 1024.0 if unit.startswith("b") and unit != "b" else value
-            if unit in ("kb",):
-                mb = value / 1024.0
-            elif unit in ("mb",):
-                mb = value
-            elif unit in ("gb",):
-                mb = value * 1024.0
-            elif unit in ("", "b"):
-                mb = value / 1024.0 / 1024.0
-        if mb and mb < 256:
-            findings.append(Finding(
-                3, "shared_buffers_low",
-                "shared_buffers is small at %s" % buff,
-                ["shared_buffers = %s (approximately %.0f MB)" % (buff, mb),
-                 "effective_cache_size = %s" % setting("effective_cache_size")],
-                "A very small shared_buffers makes PostgreSQL depend on the operating "
-                "system page cache for almost everything. That works - the OS cache is "
-                "usually large - but the planner's cost model behaves differently and "
-                "some workloads (high write rates, many concurrent writers) suffer.",
-                "If raising it, do it deliberately: it requires a RESTART and the memory "
-                "is allocated up front. A reasonable target is 25% of RAM on a dedicated "
-                "database host, and no more than about 8-16 GB on a large machine, "
-                "because beyond that the OS page cache was already serving those reads. "
-                "Also keep effective_cache_size honest (roughly 50-75% of total RAM on a "
-                "dedicated host) - it is only a planner hint and costs no memory, but a "
-                "wrong value produces wrong plan choices.",
+    buff_mb = memory_mb("shared_buffers")
+    if buff is not None and buff_mb is not None and buff_mb < 256:
+        ecs = setting("effective_cache_size")
+        ecs_mb = memory_mb("effective_cache_size")
+        ecs_evidence = "effective_cache_size = %s" % ecs
+        if ecs_mb is not None:
+            ecs_evidence += " (approximately %.0f MB)" % ecs_mb
+        findings.append(Finding(
+            3, "shared_buffers_low",
+            "shared_buffers is small at %s (approximately %.0f MB)" % (buff, buff_mb),
+            ["shared_buffers = %s (approximately %.0f MB)" % (buff, buff_mb),
+             ecs_evidence],
+            "A very small shared_buffers makes PostgreSQL depend on the operating "
+            "system page cache for almost everything. That works - the OS cache is "
+            "usually large - but the planner's cost model behaves differently and "
+            "some workloads (high write rates, many concurrent writers) suffer.",
+            "If raising it, do it deliberately: it requires a RESTART and the memory "
+            "is allocated up front. A reasonable target is 25% of RAM on a dedicated "
+            "database host, and no more than about 8-16 GB on a large machine, "
+            "because beyond that the OS page cache was already serving those reads. "
+            "Also keep effective_cache_size honest (roughly 50-75% of total RAM on a "
+            "dedicated host) - it is only a planner hint and costs no memory, but a "
+            "wrong value produces wrong plan choices.",
             "sql/06-cache-hit-and-io.sql (Q6.1)"))
     rpc = numeric("random_page_cost")
     if rpc is not None and rpc >= 4.0 and setting("effective_io_concurrency") in ("1", "0"):
@@ -1964,7 +1991,8 @@ CHECKS: List[Check] = [
                 'track_counts', 'track_io_timing', 'shared_buffers', 'work_mem',
                 'maintenance_work_mem', 'effective_cache_size', 'random_page_cost',
                 'seq_page_cost', 'effective_io_concurrency', 'max_wal_size',
-                'checkpoint_completion_target', 'max_connections', 'jit')
+                'checkpoint_completion_target', 'max_connections', 'jit',
+                'vacuum_cost_page_miss', 'vacuum_cost_page_dirty')
         ORDER BY name
         """,
         check_settings,
